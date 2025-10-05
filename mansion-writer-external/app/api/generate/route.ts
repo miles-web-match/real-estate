@@ -5,7 +5,7 @@ import { extractFactsFromHtml, factsToLines } from "../../../lib/extract";
 import type { PropertyFacts } from "../../../lib/schema";
 import { UNIT_ONLY_KEYS, UNIT_ONLY_KEYWORDS } from "../../../lib/schema";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
 
 const FETCH_TIMEOUT_MS = 10000;
 
