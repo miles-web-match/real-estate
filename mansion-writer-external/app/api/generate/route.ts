@@ -6,9 +6,13 @@ import { extractFactsFromHtml, factsToLines } from "../../../lib/extract";
 import type { PropertyFacts } from "../../../lib/schema";
 import { UNIT_ONLY_KEYS, UNIT_ONLY_KEYWORDS } from "../../../lib/schema";
 
-export const runtime = "edge"; // Cloudflare Pages (next-on-pages) 要件
+export const runtime = "edge"; // Cloudflare Pages (next-on-pages) 用
 
+// -------------------------------
+// 設定
+// -------------------------------
 const FETCH_TIMEOUT_MS = 10000;
+const MIN_FACTS_FOR_GENERATION = 3;
 
 const BANNED_WORDS = [
   "完全","完ぺき","絶対","万全","100％","フルリフォーム","理想",
@@ -21,117 +25,216 @@ const BANNED_WORDS = [
   "自己資金0円","今だけ","今しかない","今がチャンス","高利回り","空室の心配なし",
   "売主につき手数料不要","建築確認費用は価格に含む","国土交通大臣免許だから安心です","検査済証取得物件",
   "傾斜地","路地状敷地","高圧電線下",
-  "ディズニーランド","ユニバーサルスタジオジャパン","東京ドーム"
+  "ディズニーランド","ユニバーサルスタジオジャパン","東京ドーム","ユニバ ーサルスタジオジャパ ン","東京ド ーム"
 ];
 
-const InputSchema = z.object({
-  scope: z.enum(["unit", "building"]),                 // 部屋 or 棟
-  tone: z.enum(["formal","neutral","friendly"]),       // トーン
-  targetLength: z.number().min(100).max(1200),         // 目安文字数
-  name: z.string().optional(),                         // 物件名（任意）
-  urls: z.array(z.string().url()).max(3),              // 最大3URL
-  includeKeys: z.array(z.string()).optional(),         // “必ず含めたい”項目（未選択なら null/undefined）
-  extraMusts: z.array(z.string()).optional(),          // 追記事項（任意）
+const BANNED_PHRASES = [
+  "想定されます","といえるでしょう","と言えるでしょう","といえます","と言えます",
+  "感じられます","考えられます","周辺については、","周辺については、詳細な記載はありませんが",
+  "利便性が感じられます","利便性が高いと言える","でしょう。","でしょう",
+];
+
+// “上品（マンションライブラリー冒頭文風）”のスタイル指示
+function stylePresetMansionLibrary(scope: "部屋" | "棟", length: number) {
+  return `
+【出力スタイル（マンションライブラリー冒頭文風）】
+- 敬体・客観・簡潔。約${Math.max(250, Math.min(length, 600))}字、1〜2段落。
+- 構成（該当があるもののみ、順序厳守）:
+  1) 物件名 / 竣工年 / 構造 / 規模（階数・総戸数）
+  2) アクセス（最寄駅名＋徒歩分、必要あれば主要2駅まで）
+  3) 管理体制・管理会社、駐車場/駐輪場/バイク置場の有無
+  4) 規約等（ペットなど）※ページに明記がある場合のみ
+- 評価語・誇張・一般論・推測は書かない（例：「利便性が感じられます」「想定されます」は禁止）。
+- 固有名詞表記はページの表記を尊重し、省略しない。
+- ${scope === "棟"
+      ? "棟モード：専有部（間取り・専有面積・所在階・方角・室内の設備/リフォーム等）は本文に入れない。"
+      : "部屋モード：専有部の事実は記述可。"}
+`.trim();
+}
+
+// -------------------------------
+// 入出力スキーマ
+// -------------------------------
+const BodySchema = z.object({
+  sources: z.array(z.string()).max(3).optional(), // URL or テキスト（最大3）
+  source: z.string().optional(),                   // 旧互換
+  propertyName: z.string().optional(),
+  extraText: z.string().optional(),                // 追加のラベル:値（1行1項目）
+  tone: z.enum(["上品", "一般的", "親しみやすい"]).default("上品"),
+  length: z.number().int().min(200).max(1200).default(400),
+  mustIncludeKeys: z.array(z.string()).optional().default([]),
+  scope: z.enum(["部屋", "棟"]).default("部屋"),
+}).refine(v => (v.sources?.length || v.source?.length), {
+  message: "sources もしくは source を指定してください"
 });
 
-type Input = z.infer<typeof InputSchema>;
+type Body = z.infer<typeof BodySchema>;
+type JsonOk = { ok: true; text: string; description?: string; facts: PropertyFacts };
+type JsonErr = { ok: false; error: string };
 
+// -------------------------------
+// ユーティリティ
+// -------------------------------
 async function fetchWithTimeout(url: string) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal });
-    const html = await res.text();
-    return html;
-  } finally {
-    clearTimeout(id);
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; MitsuiAI-PropertyScraper/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+    if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+    return await res.text();
+  } finally { clearTimeout(id); }
+}
+
+function mergeFacts(base: PropertyFacts, add: PropertyFacts): PropertyFacts {
+  const out: PropertyFacts = { ...base };
+  for (const [k, v] of Object.entries(add)) {
+    if (!v) continue;
+    if (!out[k as keyof PropertyFacts]) (out as any)[k] = v;
+    else {
+      const cur = String(out[k as keyof PropertyFacts] ?? "");
+      const nv = String(v);
+      if (nv.length > cur.length) (out as any)[k] = nv;
+    }
   }
+  return out;
 }
 
-function buildConstraints(scope: "unit" | "building", includeKeys: string[] | undefined) {
-  // 棟モードでは、部屋専用の情報を禁止
-  const mustExclude = scope === "building"
-    ? [...UNIT_ONLY_KEYS, ...UNIT_ONLY_KEYWORDS]
-    : [];
-
-  // “必ず含めたい”が空 ⇒ 何も選択されていない → 可能な限り全部入れる
-  const includePolicy = (includeKeys && includeKeys.length > 0)
-    ? `次のラベルに該当する情報は、本文に必ず含める: ${includeKeys.join(", ")}。`
-    : `特にラベル指定が無い場合は、抽出できた正確な情報は可能な限り本文に含める。`;
-
-  return { mustExclude, includePolicy };
+function stripUnitOnlyFactsForBuildingScope(facts: PropertyFacts, scope: "部屋" | "棟") {
+  if (scope === "部屋") return facts;
+  const filtered: PropertyFacts = { ...facts };
+  for (const k of UNIT_ONLY_KEYS) delete filtered[k];
+  return filtered;
 }
 
+function stripUnitOnlySentences(text: string, scope: "部屋" | "棟") {
+  if (scope === "部屋") return text;
+  const sentences = text.split(/(?<=。|\n)/);
+  return (sentences.filter(s => !UNIT_ONLY_KEYWORDS.some(kw => s.includes(kw))).join("").trim()
+          || sentences[0] || "").trim();
+}
+
+function dropBannedPhrases(text: string) {
+  const sentences = text.split(/(?<=[。！!？\n])/);
+  return sentences.filter(s => !BANNED_PHRASES.some(p => s.includes(p))).join("").trim();
+}
+
+function sanitizeForbidden(text: string) {
+  let out = text;
+  for (const w of BANNED_WORDS) out = out.replaceAll(w, `※${w}（表現調整）`);
+  return out.trim();
+}
+
+function countFacts(obj: PropertyFacts) {
+  return Object.values(obj).filter(v => typeof v === "string" && v.trim()).length;
+}
+
+function parseManualFacts(text?: string): PropertyFacts {
+  const out: PropertyFacts = {};
+  if (!text) return out;
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^\s*([^:：]+)\s*[:：]\s*(.+?)\s*$/);
+    if (m) out[m[1].trim()] = m[2].trim();
+  }
+  return out;
+}
+
+function factOnlyOutput(facts: PropertyFacts, scope: "部屋"|"棟") {
+  const lines = Object.entries(facts).filter(([,v])=>!!v).map(([k,v])=>`・${k}：${v}`).join("\n");
+  const advice = scope === "棟"
+    ? "（棟スコープでは専有部の情報は扱いません。建物名／所在地／築年／構造／総戸数／階数／最寄駅／徒歩分／管理体制 などをページに記載してください）"
+    : "（部屋スコープでは間取り／専有面積／所在階／方角／リフォーム／室内設備 などがあると生成精度が上がります）";
+  return ["【生成停止：情報が不足しています】","ページから抽出できた事実のみを表示します（推測は行いません）。","",
+          "【抽出できた事実】", lines || "・（抽出できませんでした）","", "【お願い】", advice].join("\n");
+}
+
+// -------------------------------
+// メイン
+// -------------------------------
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const input = InputSchema.parse(body) as Input;
+    const parsed = BodySchema.parse(await req.json()) as Body;
+    const sources = (parsed.sources ?? (parsed.source ? [parsed.source] : []))
+      .map(s => s.trim()).filter(Boolean).slice(0, 3);
 
-    // 1) URL から HTML を取得 & 事実抽出（lib/extract.ts）
-    const htmlList = await Promise.all(
-      input.urls.map((u) => fetchWithTimeout(u).catch(() => "")) // 失敗は空文字に
-    );
-    const extracted: PropertyFacts[] = [];
-    for (const html of htmlList) {
-      if (!html) continue;
-      const facts = await extractFactsFromHtml(html);
-      extracted.push(facts);
+    const { propertyName, extraText, tone, length, mustIncludeKeys, scope } = parsed;
+
+    // 1) 収集
+    let merged: PropertyFacts = {};
+    for (const s of sources) {
+      if (/^https?:\/\/\S+$/i.test(s)) {
+        try {
+          const html = await fetchWithTimeout(s);
+          const { facts } = extractFactsFromHtml(html);
+          merged = mergeFacts(merged, facts);
+        } catch { /* ignore */ }
+      } else {
+        // テキスト貼付にも対応（HTMLでない場合）
+        const { facts } = extractFactsFromHtml(s);
+        merged = mergeFacts(merged, facts);
+      }
+    }
+    if (propertyName?.trim()) merged["物件名"] = propertyName.trim();
+    merged = { ...merged, ...parseManualFacts(extraText) };
+
+    const scopedFacts = stripUnitOnlyFactsForBuildingScope(merged, scope);
+    if (countFacts(scopedFacts) < MIN_FACTS_FOR_GENERATION) {
+      const res: JsonOk = { ok: true, text: factOnlyOutput(scopedFacts, scope), description: undefined, facts: scopedFacts };
+      return NextResponse.json(res);
     }
 
-    // 2) 事実を“箇条書きテキスト”へ整形（モデルにはこれだけ渡す）
-    const factLines = factsToLines(extracted);
+    // 2) 事実列（モデルへの入力素材）
+    const lines = factsToLines(scopedFacts);
+    const allowedKeys = Object.entries(scopedFacts)
+      .filter(([,v]) => typeof v === "string" && v.trim())
+      .map(([k]) => k);
 
-    // 3) 追加で“必ず入れたい”自由記述
-    const extraMusts = input.extraMusts?.filter(Boolean) ?? [];
+    // 3) スタイル・指示
+    const toneLine = tone === "上品" ? "上品で落ち着いた語調（です・ます）、簡潔かつ客観的。" :
+                     tone === "親しみやすい" ? "親しみやすい語調だが誇張なし、簡潔で客観的。" :
+                     "標準的な広告文の語調、誇張や主観なし。";
 
-    // 4) 棟/部屋ごとの制約組み立て
-    const { mustExclude, includePolicy } = buildConstraints(input.scope, input.includeKeys);
+    const mustLine = (mustIncludeKeys?.length ?? 0) > 0
+      ? `次の“必須含有（該当があれば）”は本文に自然に含める: ${mustIncludeKeys.join(", ")}`
+      : "必須指定なし。抽出できた事実は可能な限り本文へ反映。";
 
-    // 5) プロンプト（モデルには曖昧な推測を絶対させない）
-    const nameLine = input.name ? `物件名: ${input.name}\n` : "";
     const system = [
       "あなたは日本の不動産広告文ライターです。",
-      "以下の箇条書き“事実リスト”に書かれている内容の**み**を使って文章を作成します。",
-      "リストに無い事項は**書かない**（推測・一般論・想像は禁止）。",
-      `禁止ワード（使わない）: ${BANNED_WORDS.join("、")}`,
-      input.scope === "building"
-        ? "今は“棟（マンション全体）”の説明モードです。部屋位置・方角・室内設備・リフォーム/リノベ等の“専有部情報”は本文に入れない。"
-        : "今は“部屋（専有部）”の説明モードです。部屋に関する情報は許可されます。",
-      includePolicy,
-      mustExclude.length
-        ? `本文に含めてはならないラベル/語: ${mustExclude.join("、")}`
-        : "",
-      "本文は日本語。社名や自社強調は入れない。誇大表現は避ける。事実ベースで簡潔に。",
-    ].filter(Boolean).join("\n");
-
-    const user = [
-      nameLine,
-      "【事実リスト】（この箇条書きに存在する内容だけを使う）",
-      factLines.length ? factLines.map((l) => `・${l}`).join("\n") : "（該当なし）",
-      extraMusts.length ? `\n【必ず本文に反映】\n${extraMusts.map((s) => `・${s}`).join("\n")}` : "",
-      `\n出力要件:\n- 文字量の目安: 約${input.targetLength}文字\n- 箇条書きは使わず本文のみ\n- 不明な点は書かない。一般的な推測の文（「〜と想定されます」「〜が感じられます」など）も禁止`,
+      "以下の“事実リスト”に存在する情報【のみ】で本文を作成します。推測・一般論・感想は禁止。",
+      `禁止語: ${BANNED_WORDS.join("、")}`,
+      toneLine,
+      stylePresetMansionLibrary(scope, length),
+      mustLine,
+      `許可キー（本文で使ってよい情報の種類）: ${allowedKeys.join(", ")}`,
+      "本文は1〜2段落。箇条書きや見出しは使わない。"
     ].join("\n");
 
-    // 6) OpenAI 呼び出し（Responses API）— ここが修正ポイント
+    const user = [
+      propertyName?.trim() ? `物件名: ${propertyName.trim()}` : "",
+      "【事実リスト】（値は本文に原文どおり記載すること）",
+      lines.map(l => `・${l}`).join("\n")
+    ].join("\n");
+
+    // 4) OpenAI 呼び出し（Responses API / text.format による JSON 指定）
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-    const response = await client.responses.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini", // お好みで
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ],
-      // ❗ 旧: response_format → 新: text.format に移行
+    const resp = await client.responses.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      instructions: system,
+      input: user,
       text: {
         format: {
           type: "json_schema",
-          name: "property_description",
+          name: "property_description_v1",
           schema: {
             type: "object",
             properties: {
-              description: { type: "string", minLength: 50 },
-              usedFacts: { type: "array", items: { type: "string" } },
-              skippedFacts: { type: "array", items: { type: "string" } }
+              description: { type: "string", minLength: 80, description: "本文（1〜2段落）。" }
             },
             required: ["description"],
             additionalProperties: false
@@ -141,46 +244,24 @@ export async function POST(req: NextRequest) {
       }
     });
 
-    // DataCamp の例と同じく、output_text に JSON 文字列が入る想定
-    // 参考: “text.format” の使用例（外部記事）に準拠
-    // https://www.datacamp.com/tutorial/openai-responses-api
-    const raw = response.output_text ?? "";
-    let parsed: { description: string; usedFacts?: string[]; skippedFacts?: string[] };
-
+    // 5) 応答の取得とクレンジング
+    const raw = (resp as any).output_text ?? ""; // 便宜プロパティ
+    let description = raw;
     try {
-      parsed = JSON.parse(raw);
-    } catch {
-      // 念のためテキストのみ返すフォールバック
-      parsed = { description: raw };
-    }
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.description === "string") description = parsed.description;
+    } catch { /* raw をそのまま使用 */ }
 
-    // 禁止語の最終チェック（万一混入時は削除）
-    let safe = parsed.description || "";
-    for (const ng of BANNED_WORDS) {
-      const re = new RegExp(ng, "g");
-      safe = safe.replace(re, "");
-    }
+    // フィルタ（一般論・禁止語・棟モード専有部除外）
+    description = dropBannedPhrases(description);
+    description = sanitizeForbidden(description);
+    description = stripUnitOnlySentences(description, scope);
 
-    // 棟モードの禁止（専有部ニュアンスの）単語ざっくりフィルタ
-    if (input.scope === "building") {
-      const roughUnitWords = ["室内", "専有", "リフォーム", "リノベーション", "床暖房", "システムキッチン", "ウォークインクローゼット"];
-      const re = new RegExp(roughUnitWords.join("|"), "g");
-      safe = safe.replace(re, "");
-    }
-
-    return NextResponse.json(
-      {
-        ok: true,
-        description: safe.trim(),
-        debug: {
-          usedFacts: parsed.usedFacts ?? [],
-          skippedFacts: parsed.skippedFacts ?? [],
-        }
-      },
-      { status: 200 }
-    );
+    const json: JsonOk = { ok: true, text: description.trim(), description: description.trim(), facts: scopedFacts };
+    return NextResponse.json(json);
   } catch (err: any) {
-    const msg = err?.message || "Unexpected error";
-    return NextResponse.json({ ok: false, error: msg }, { status: 400 });
+    const json: JsonErr = { ok: false, error: String(err?.message || "Server Error") };
+    // エラー時も必ず JSON で返す（フロントの緩やかパーサで読める）
+    return NextResponse.json(json, { status: 400 });
   }
 }
