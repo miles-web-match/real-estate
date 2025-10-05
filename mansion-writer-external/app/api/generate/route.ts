@@ -1,3 +1,4 @@
+// app/api/generate/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { z } from "zod";
@@ -132,13 +133,11 @@ function factOnlyOutput(facts: PropertyFacts, scope: "部屋"|"棟") {
           "【抽出できた事実】", lines || "・（抽出できませんでした）","", "【お願い】", advice].join("\n");
 }
 
-// 最初の {…} を抜き出す簡易パーサ（前後のゴミを無視）
+// モデルが返す JSON の前後にゴミが付いた場合でも最初の {…} を抜き出す
 function extractFirstJsonObject(input: string): string | null {
   const start = input.indexOf("{");
   if (start === -1) return null;
-  let depth = 0;
-  let inString = false;
-  let prev = "";
+  let depth = 0, inString = false, prev = "";
   for (let i = start; i < input.length; i++) {
     const ch = input[i];
     if (ch === '"' && prev !== "\\") inString = !inString;
@@ -154,7 +153,6 @@ function extractFirstJsonObject(input: string): string | null {
   return null;
 }
 
-// JSONスキーマ（各文は根拠 keys を必須）
 const JSON_SCHEMA = {
   name: "factual_mansion_write",
   schema: {
@@ -263,11 +261,9 @@ ${materialText}
       instructions:
         "不動産ガイドライン順守。スキーマに厳密準拠。一般論・推測は禁止。JSON以外を返さない。",
       input: prompt,
-      // 念のためテキストのみ
       modalities: ["text"],
     });
 
-    // ---- JSON を頑健に取得 ----
     const raw = (ai.output_text || "").trim();
     const jsonStr = extractFirstJsonObject(raw);
     if (!jsonStr) {
@@ -280,7 +276,6 @@ ${materialText}
       return NextResponse.json({ text: factOnlyOutput(scopedFacts, scope), facts: scopedFacts });
     }
 
-    // ---- 許可キー検査・値一致検査・フレーズ除去 ----
     const allowed = new Set(allowedKeys);
     const paragraphs: string[] = [];
     if (Array.isArray(payload?.sections)) {
@@ -315,6 +310,7 @@ ${materialText}
     return NextResponse.json({ text: finalText, facts: scopedFacts });
   } catch (err: any) {
     const message = typeof err?.message === "string" ? err.message : "Server Error";
-    return new NextResponse(message, { status: 500 });
+    // ← エラー時も必ず JSON を返す
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
