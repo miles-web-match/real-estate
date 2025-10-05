@@ -1,4 +1,3 @@
-// app/api/generate/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { z } from "zod";
@@ -6,11 +5,11 @@ import { extractFactsFromHtml, factsToLines } from "../../../lib/extract";
 import type { PropertyFacts } from "../../../lib/schema";
 import { UNIT_ONLY_KEYS, UNIT_ONLY_KEYWORDS } from "../../../lib/schema";
 
-export const runtime = "edge"; // ← Cloudflare Pages + next-on-pages で必須
+export const runtime = "edge";
 
 const FETCH_TIMEOUT_MS = 10000;
+const MIN_FACTS_FOR_GENERATION = 3;
 
-// 禁止語（あなた指定のリスト）
 const BANNED_WORDS = [
   "完全","完ぺき","絶対","万全","100％","フルリフォーム","理想",
   "日本一","日本初","業界一","超","当社だけ","他に類を見ない","抜群","一流",
@@ -25,12 +24,17 @@ const BANNED_WORDS = [
   "ディズニーランド","ユニバーサルスタジオジャパン","東京ドーム","ユニバ ーサルスタジオジャパ ン","東京ド ーム"
 ];
 
-const InputSchema = z.object({
-  source: z.string().min(1),
+const BodySchema = z.object({
+  // 互換：旧UIの source も受け付ける
+  source: z.string().optional(),
+  sources: z.array(z.string()).optional(),
+  propertyName: z.string().optional(),
   tone: z.enum(["上品・落ち着き", "一般的", "親しみやすい"]),
   length: z.number().int().min(300).max(1200),
   mustIncludeKeys: z.array(z.string()).optional().default([]),
   scope: z.enum(["部屋", "棟"]).default("部屋"),
+}).refine(v => (v.sources?.length || v.source?.length), {
+  message: "sources もしくは source を指定してください"
 });
 
 function sanitizeForbidden(text: string) {
@@ -59,6 +63,22 @@ async function fetchWithTimeout(url: string) {
   }
 }
 
+function mergeFacts(base: PropertyFacts, add: PropertyFacts): PropertyFacts {
+  const out: PropertyFacts = { ...base };
+  for (const [k, v] of Object.entries(add)) {
+    if (!v) continue;
+    if (!out[k as keyof PropertyFacts]) {
+      (out as any)[k] = v;
+    } else {
+      const cur = String(out[k as keyof PropertyFacts] ?? "");
+      const nv = String(v);
+      // 長い方（情報量が多い方）を採用
+      if (nv.length > cur.length) (out as any)[k] = nv;
+    }
+  }
+  return out;
+}
+
 function stripUnitOnlyFactsForBuildingScope(
   facts: PropertyFacts,
   scope: "部屋" | "棟"
@@ -85,14 +105,7 @@ function enforceMustInclude(
   scope: "部屋" | "棟"
 ) {
   const unitOnly = new Set([
-    "間取り",
-    "専有面積",
-    "バルコニー面積",
-    "階",
-    "方角",
-    "リフォーム",
-    "リノベーション",
-    "室内設備",
+    "間取り","専有面積","バルコニー面積","階","方角","リフォーム","リノベーション","室内設備",
   ]);
   const applicable = scope === "棟" ? keys.filter((k) => !unitOnly.has(k)) : keys;
   const missing: Array<{ key: string; value: string }> = [];
@@ -113,31 +126,79 @@ function enforceMustInclude(
   );
 }
 
+function countFacts(obj: PropertyFacts) {
+  return Object.values(obj).filter((v) => typeof v === "string" && v.trim()).length;
+}
+
+function factOnlyOutput(facts: PropertyFacts, scope: "部屋" | "棟") {
+  const lines = Object.entries(facts)
+    .filter(([, v]) => !!v)
+    .map(([k, v]) => `・${k}：${v}`)
+    .join("\n");
+
+  const advice =
+    scope === "棟"
+      ? "（棟スコープでは専有部の情報は扱いません。建物名／所在地／築年／構造／総戸数／階数／最寄駅／徒歩分／管理体制 などをページに記載してください）"
+      : "（部屋スコープでは間取り／専有面積／所在階／方角／リフォーム／室内設備 などがあると生成精度が上がります）";
+
+  return [
+    "【生成停止：情報が不足しています】",
+    "ページから抽出できた事実のみを表示します（推測は行いません）。",
+    "",
+    "【抽出できた事実】",
+    lines || "・（抽出できませんでした）",
+    "",
+    "【お願い】",
+    advice,
+  ].join("\n");
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { source, tone, length, mustIncludeKeys, scope } = InputSchema.parse(
-      await req.json()
-    );
+    const parsed = BodySchema.parse(await req.json());
+    const sources = (parsed.sources ?? (parsed.source ? [parsed.source] : []))
+      .map(s => s.trim())
+      .filter(Boolean)
+      .slice(0, 10);
 
-    let facts: PropertyFacts = {};
-    let materialText = source;
+    const { propertyName, tone, length, mustIncludeKeys, scope } = parsed;
 
-    // URLならスクレイピング
-    if (/^https?:\/\/\S+$/i.test(source.trim())) {
-      try {
-        const html = await fetchWithTimeout(source.trim());
-        const result = extractFactsFromHtml(html);
-        facts = result.facts;
-      } catch {
-        facts = {};
+    let merged: PropertyFacts = {};
+
+    // 各ソースを処理（URLなら取得→抽出、テキストなら後で事実化の材料）
+    const freeTexts: string[] = [];
+    for (const s of sources) {
+      if (/^https?:\/\/\S+$/i.test(s)) {
+        try {
+          const html = await fetchWithTimeout(s);
+          const { facts } = extractFactsFromHtml(html);
+          merged = mergeFacts(merged, facts);
+        } catch {
+          // 無視（次のソースへ）
+        }
+      } else {
+        freeTexts.push(s);
       }
     }
 
-    // スコープに応じて“部屋専用”情報を除外
-    const scopedFacts = stripUnitOnlyFactsForBuildingScope(facts, scope);
-    materialText = Object.keys(scopedFacts).length
-      ? factsToLines(scopedFacts)
-      : source;
+    // 物件名（任意）を事実として付与
+    if (propertyName?.trim()) {
+      merged["物件名"] = propertyName.trim();
+    }
+
+    // スコープ適用
+    const scopedFacts = stripUnitOnlyFactsForBuildingScope(merged, scope);
+
+    // 情報不足なら生成せず返す
+    if (countFacts(scopedFacts) < MIN_FACTS_FOR_GENERATION) {
+      return NextResponse.json({ text: factOnlyOutput(scopedFacts, scope), facts: scopedFacts });
+    }
+
+    // 生成に使う素材（抽出事実＋自由テキスト）
+    const materialText = [
+      factsToLines(scopedFacts),
+      freeTexts.length ? `\n【追記事実（手入力）】\n${freeTexts.join("\n")}` : ""
+    ].join("");
 
     const mustFactsLines = mustIncludeKeys
       .filter((k) => scopedFacts[k as keyof PropertyFacts])
@@ -156,7 +217,8 @@ export async function POST(req: NextRequest) {
 出力要件:
 - 構成: 冒頭1–2文の全体像 → 立地/アクセス → 建物概要（築年・構造・規模・管理体制 等） → 周辺環境 → まとめ
 - 断定・最上級・比較優位の誇張を避ける
-- 推測禁止。事実リストに無い数値や固有名詞は書かない
+- **事実に無い一般論（例：買い物が便利・飲食店が多い・公園がある など）は書かない**
+- **事実が不足する要素は「記載なし」または言及しない**（推測禁止）
 ${scopeRule}
 - 次の“必須含有項目（該当があれば）”は本文に自然に含めること
 ${mustFactsLines || "  - （該当なし）"}
@@ -165,19 +227,14 @@ ${mustFactsLines || "  - （該当なし）"}
 ${BANNED_WORDS.join("、")}
 
 事実リスト:
-${materialText || "（提供情報なし）"}
-
-注意:
-- 数値表現は「約〜」など控えめに
-- 優良誤認の恐れがある表現は避ける
+${materialText}
 `;
 
-    // OpenAI Responses API（messages ではなく input/instructions を使う）
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const res = await client.responses.create({
       model: "gpt-4.1-mini",
       instructions:
-        "あなたは不動産ガイドラインに配慮できる日本語ライターです。事実を尊重し、誇張を避けてください。",
+        "あなたは不動産ガイドラインに配慮できる日本語ライターです。事実のみを用い、一般論や推測は書かないでください。",
       input: prompt,
     });
 
@@ -191,11 +248,9 @@ ${materialText || "（提供情報なし）"}
       scope
     );
 
-    return NextResponse.json({ text: finalText });
+    return NextResponse.json({ text: finalText, facts: scopedFacts });
   } catch (err: any) {
-    // 例: OpenAIキー未設定/権限エラーなどもここに来る
-    const message =
-      typeof err?.message === "string" ? err.message : "Server Error";
+    const message = typeof err?.message === "string" ? err.message : "Server Error";
     return new NextResponse(message, { status: 500 });
   }
 }
