@@ -1,3 +1,4 @@
+// app/api/generate/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { z } from "zod";
@@ -5,10 +6,11 @@ import { extractFactsFromHtml, factsToLines } from "../../../lib/extract";
 import type { PropertyFacts } from "../../../lib/schema";
 import { UNIT_ONLY_KEYS, UNIT_ONLY_KEYWORDS } from "../../../lib/schema";
 
-export const runtime = "edge";
+export const runtime = "edge"; // ← Cloudflare Pages + next-on-pages で必須
 
 const FETCH_TIMEOUT_MS = 10000;
 
+// 禁止語（あなた指定のリスト）
 const BANNED_WORDS = [
   "完全","完ぺき","絶対","万全","100％","フルリフォーム","理想",
   "日本一","日本初","業界一","超","当社だけ","他に類を見ない","抜群","一流",
@@ -44,8 +46,10 @@ async function fetchWithTimeout(url: string) {
     const res = await fetch(url, {
       signal: ctrl.signal,
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; MitsuiAI-PropertyScraper/1.0; +https://example.com/bot)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent":
+          "Mozilla/5.0 (compatible; MitsuiAI-PropertyScraper/1.0; +https://example.com/bot)",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
     });
     if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
@@ -55,7 +59,10 @@ async function fetchWithTimeout(url: string) {
   }
 }
 
-function stripUnitOnlyFactsForBuildingScope(facts: PropertyFacts, scope: "部屋" | "棟"): PropertyFacts {
+function stripUnitOnlyFactsForBuildingScope(
+  facts: PropertyFacts,
+  scope: "部屋" | "棟"
+): PropertyFacts {
   if (scope === "部屋") return facts;
   const filtered: PropertyFacts = { ...facts };
   for (const k of UNIT_ONLY_KEYS) delete filtered[k];
@@ -65,31 +72,57 @@ function stripUnitOnlyFactsForBuildingScope(facts: PropertyFacts, scope: "部屋
 function stripUnitOnlySentences(text: string, scope: "部屋" | "棟") {
   if (scope === "部屋") return text;
   const sentences = text.split(/(?<=。|\n)/);
-  const filtered = sentences.filter((s) => !UNIT_ONLY_KEYWORDS.some((kw) => s.includes(kw)));
+  const filtered = sentences.filter(
+    (s) => !UNIT_ONLY_KEYWORDS.some((kw) => s.includes(kw))
+  );
   return (filtered.join("").trim() || sentences[0] || "").trim();
 }
 
-function enforceMustInclude(text: string, facts: PropertyFacts, keys: string[], scope: "部屋" | "棟") {
-  const unitOnly = new Set(["間取り","専有面積","バルコニー面積","階","方角","リフォーム","リノベーション","室内設備"]);
+function enforceMustInclude(
+  text: string,
+  facts: PropertyFacts,
+  keys: string[],
+  scope: "部屋" | "棟"
+) {
+  const unitOnly = new Set([
+    "間取り",
+    "専有面積",
+    "バルコニー面積",
+    "階",
+    "方角",
+    "リフォーム",
+    "リノベーション",
+    "室内設備",
+  ]);
   const applicable = scope === "棟" ? keys.filter((k) => !unitOnly.has(k)) : keys;
   const missing: Array<{ key: string; value: string }> = [];
   for (const k of applicable) {
     const v = facts[k];
     if (!v) continue;
-    const ok = text.includes(v) || text.includes(`${k}：${v}`) || text.includes(`${k}:${v}`);
+    const ok =
+      text.includes(v) ||
+      text.includes(`${k}：${v}`) ||
+      text.includes(`${k}:${v}`);
     if (!ok) missing.push({ key: k, value: v });
   }
   if (!missing.length) return text;
-  return text + "\n\n【情報の明示（抽出値）】\n" + missing.map((m) => `・${m.key}：${m.value}`).join("\n");
+  return (
+    text +
+    "\n\n【情報の明示（抽出値）】\n" +
+    missing.map((m) => `・${m.key}：${m.value}`).join("\n")
+  );
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const { source, tone, length, mustIncludeKeys, scope } = InputSchema.parse(await req.json());
+    const { source, tone, length, mustIncludeKeys, scope } = InputSchema.parse(
+      await req.json()
+    );
 
     let facts: PropertyFacts = {};
     let materialText = source;
 
+    // URLならスクレイピング
     if (/^https?:\/\/\S+$/i.test(source.trim())) {
       try {
         const html = await fetchWithTimeout(source.trim());
@@ -100,17 +133,21 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // スコープに応じて“部屋専用”情報を除外
     const scopedFacts = stripUnitOnlyFactsForBuildingScope(facts, scope);
-    materialText = Object.keys(scopedFacts).length ? factsToLines(scopedFacts) : source;
+    materialText = Object.keys(scopedFacts).length
+      ? factsToLines(scopedFacts)
+      : source;
 
     const mustFactsLines = mustIncludeKeys
       .filter((k) => scopedFacts[k as keyof PropertyFacts])
       .map((k) => `  - ${k}: ${scopedFacts[k as keyof PropertyFacts]}`)
       .join("\n");
 
-    const scopeRule = scope === "部屋"
-      ? "- 専有部（間取り・専有面積・所在階・方角・室内のリフォーム/設備 等）も、事実があれば自然に記述してよい"
-      : "- 建物全体（共用部・管理・規模・立地・周辺環境）にフォーカスし、専有部の情報（間取り・専有面積・所在階・方角・室内のリフォーム/設備 等）は記述しない";
+    const scopeRule =
+      scope === "部屋"
+        ? "- 専有部（間取り・専有面積・所在階・方角・室内のリフォーム/設備 等）も、事実があれば自然に記述してよい"
+        : "- 建物全体（共用部・管理・規模・立地・周辺環境）にフォーカスし、専有部の情報（間取り・専有面積・所在階・方角・室内のリフォーム/設備 等）は記述しない";
 
     const prompt = `あなたは日本の不動産仲介サイト向けライターです。以下の「事実リスト」を厳守し、
 誇大広告を避け、指定トーン「${tone}」、目安文字数「${length}字」で紹介文を書いてください。
@@ -135,23 +172,30 @@ ${materialText || "（提供情報なし）"}
 - 優良誤認の恐れがある表現は避ける
 `;
 
+    // OpenAI Responses API（messages ではなく input/instructions を使う）
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const res = await client.responses.create({
       model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: "あなたは不動産ガイドラインに配慮できる日本語ライターです。事実を尊重し、誇張を避けてください。" },
-        { role: "user", content: prompt },
-      ],
+      instructions:
+        "あなたは不動産ガイドラインに配慮できる日本語ライターです。事実を尊重し、誇張を避けてください。",
+      input: prompt,
     });
 
     const raw = res.output_text || "";
     const cleaned = sanitizeForbidden(raw);
     const scopedCleaned = stripUnitOnlySentences(cleaned, scope);
-    const finalText = enforceMustInclude(scopedCleaned, scopedFacts, mustIncludeKeys, scope);
+    const finalText = enforceMustInclude(
+      scopedCleaned,
+      scopedFacts,
+      mustIncludeKeys,
+      scope
+    );
 
     return NextResponse.json({ text: finalText });
   } catch (err: any) {
-    console.error(err);
-    return new NextResponse(err?.message || "Server Error", { status: 500 });
+    // 例: OpenAIキー未設定/権限エラーなどもここに来る
+    const message =
+      typeof err?.message === "string" ? err.message : "Server Error";
+    return new NextResponse(message, { status: 500 });
   }
 }
