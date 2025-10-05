@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { z } from "zod";
-import { extractFactsFromHtml, factsToLines } from "../../../../lib/extract";
-import type { PropertyFacts } from "../../../../lib/schema";
-import { UNIT_ONLY_KEYS, UNIT_ONLY_KEYWORDS } from "../../../../lib/schema";
+import { extractFactsFromHtml, factsToLines } from "../../../lib/extract";
+import type { PropertyFacts } from "../../../lib/schema";
+import { UNIT_ONLY_KEYS, UNIT_ONLY_KEYWORDS } from "../../../lib/schema";
 
 export const runtime = "nodejs";
 
