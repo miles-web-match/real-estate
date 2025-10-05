@@ -1,3 +1,4 @@
+// app/api/generate/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { z } from "zod";
@@ -5,11 +6,12 @@ import { extractFactsFromHtml, factsToLines } from "../../../lib/extract";
 import type { PropertyFacts } from "../../../lib/schema";
 import { UNIT_ONLY_KEYS, UNIT_ONLY_KEYWORDS } from "../../../lib/schema";
 
-export const runtime = "edge";
+export const runtime = "edge"; // Cloudflare Pages + next-on-pages で必須
 
 const FETCH_TIMEOUT_MS = 10000;
-const MIN_FACTS_FOR_GENERATION = 3;
+const MIN_FACTS_FOR_GENERATION = 3; // これ未満なら生成しない（安全弁）
 
+// 禁止語（ご指定のリスト）
 const BANNED_WORDS = [
   "完全","完ぺき","絶対","万全","100％","フルリフォーム","理想",
   "日本一","日本初","業界一","超","当社だけ","他に類を見ない","抜群","一流",
@@ -25,13 +27,15 @@ const BANNED_WORDS = [
 ];
 
 const BodySchema = z.object({
-  // 互換：旧UIの source も受け付ける
+  // UI からは sources 配列を送ります（3件まで）
+  sources: z.array(z.string()).max(3).optional(),
+  // 旧互換：source 単体でも受け付け
   source: z.string().optional(),
-  sources: z.array(z.string()).optional(),
   propertyName: z.string().optional(),
+  extraText: z.string().optional(), // 任意の追記事実（「ラベル:値」を1行1項目）
   tone: z.enum(["上品・落ち着き", "一般的", "親しみやすい"]),
   length: z.number().int().min(300).max(1200),
-  mustIncludeKeys: z.array(z.string()).optional().default([]),
+  mustIncludeKeys: z.array(z.string()).optional().default([]), // 初期は空
   scope: z.enum(["部屋", "棟"]).default("部屋"),
 }).refine(v => (v.sources?.length || v.source?.length), {
   message: "sources もしくは source を指定してください"
@@ -104,6 +108,7 @@ function enforceMustInclude(
   keys: string[],
   scope: "部屋" | "棟"
 ) {
+  if (!keys.length) return text; // 何も選ばれていなければ強制挿入はしない
   const unitOnly = new Set([
     "間取り","専有面積","バルコニー面積","階","方角","リフォーム","リノベーション","室内設備",
   ]);
@@ -128,6 +133,16 @@ function enforceMustInclude(
 
 function countFacts(obj: PropertyFacts) {
   return Object.values(obj).filter((v) => typeof v === "string" && v.trim()).length;
+}
+
+function parseManualFacts(text?: string): PropertyFacts {
+  const out: PropertyFacts = {};
+  if (!text) return out;
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^\s*([^:：]+)\s*[:：]\s*(.+?)\s*$/);
+    if (m) out[m[1].trim()] = m[2].trim();
+  }
+  return out;
 }
 
 function factOnlyOutput(facts: PropertyFacts, scope: "部屋" | "棟") {
@@ -159,14 +174,12 @@ export async function POST(req: NextRequest) {
     const sources = (parsed.sources ?? (parsed.source ? [parsed.source] : []))
       .map(s => s.trim())
       .filter(Boolean)
-      .slice(0, 10);
+      .slice(0, 3); // 最大3件
 
-    const { propertyName, tone, length, mustIncludeKeys, scope } = parsed;
+    const { propertyName, extraText, tone, length, mustIncludeKeys, scope } = parsed;
 
     let merged: PropertyFacts = {};
-
-    // 各ソースを処理（URLなら取得→抽出、テキストなら後で事実化の材料）
-    const freeTexts: string[] = [];
+    // URLを順に処理
     for (const s of sources) {
       if (/^https?:\/\/\S+$/i.test(s)) {
         try {
@@ -174,19 +187,17 @@ export async function POST(req: NextRequest) {
           const { facts } = extractFactsFromHtml(html);
           merged = mergeFacts(merged, facts);
         } catch {
-          // 無視（次のソースへ）
+          // 取得失敗は無視
         }
-      } else {
-        freeTexts.push(s);
       }
     }
 
     // 物件名（任意）を事実として付与
-    if (propertyName?.trim()) {
-      merged["物件名"] = propertyName.trim();
-    }
+    if (propertyName?.trim()) merged["物件名"] = propertyName.trim();
+    // 追記事実（入力があれば）を上書きマージ
+    merged = { ...merged, ...parseManualFacts(extraText) };
 
-    // スコープ適用
+    // スコープ反映
     const scopedFacts = stripUnitOnlyFactsForBuildingScope(merged, scope);
 
     // 情報不足なら生成せず返す
@@ -194,11 +205,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ text: factOnlyOutput(scopedFacts, scope), facts: scopedFacts });
     }
 
-    // 生成に使う素材（抽出事実＋自由テキスト）
-    const materialText = [
-      factsToLines(scopedFacts),
-      freeTexts.length ? `\n【追記事実（手入力）】\n${freeTexts.join("\n")}` : ""
-    ].join("");
+    // 生成に使う素材
+    const materialText = factsToLines(scopedFacts);
 
     const mustFactsLines = mustIncludeKeys
       .filter((k) => scopedFacts[k as keyof PropertyFacts])
@@ -210,6 +218,11 @@ export async function POST(req: NextRequest) {
         ? "- 専有部（間取り・専有面積・所在階・方角・室内のリフォーム/設備 等）も、事実があれば自然に記述してよい"
         : "- 建物全体（共用部・管理・規模・立地・周辺環境）にフォーカスし、専有部の情報（間取り・専有面積・所在階・方角・室内のリフォーム/設備 等）は記述しない";
 
+    const mustInstruction =
+      mustIncludeKeys.length === 0
+        ? "- （必須指定なし）抽出できた事実は可能な限り自然に本文へ反映する"
+        : `- 次の“必須含有項目（該当があれば）”は本文に自然に含めること\n${mustFactsLines || "  - （該当なし）"}`;
+
     const prompt = `あなたは日本の不動産仲介サイト向けライターです。以下の「事実リスト」を厳守し、
 誇大広告を避け、指定トーン「${tone}」、目安文字数「${length}字」で紹介文を書いてください。
 対象スコープ: 「${scope}」
@@ -220,8 +233,7 @@ export async function POST(req: NextRequest) {
 - **事実に無い一般論（例：買い物が便利・飲食店が多い・公園がある など）は書かない**
 - **事実が不足する要素は「記載なし」または言及しない**（推測禁止）
 ${scopeRule}
-- 次の“必須含有項目（該当があれば）”は本文に自然に含めること
-${mustFactsLines || "  - （該当なし）"}
+${mustInstruction}
 
 禁止語の例（生成時は使わないこと。もし入力に含まれていても本文では避けること）:
 ${BANNED_WORDS.join("、")}
