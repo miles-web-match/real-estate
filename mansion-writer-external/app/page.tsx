@@ -3,173 +3,175 @@
 import { useState } from "react";
 import { Button } from "../components/Button";
 
-type Tone = "上品・落ち着き" | "一般的" | "親しみやすい";
-type Scope = "部屋" | "棟";
+const ALL_KEYS = [
+  "所在地","築年","構造","総戸数","階数","最寄駅","徒歩分","管理体制","管理会社",
+  "設備","学区","駐車場","間取り","専有面積","バルコニー面積","階","方角",
+  "リフォーム","リノベーション","室内設備"
+] as const;
 
-const CANDIDATE_KEYS = [
-  "所在地","築年","構造","総戸数","階数","最寄駅","徒歩分","管理体制","管理会社","設備","学区","駐車場",
-  "間取り","専有面積","バルコニー面積","階","方角","リフォーム","リノベーション","室内設備",
-];
-
-export default function Home() {
-  const [source, setSource] = useState("");
-  const [tone, setTone] = useState<Tone>("上品・落ち着き");
+export default function Page() {
+  const [urlsText, setUrlsText] = useState("");
+  const [propertyName, setPropertyName] = useState("");
+  const [scope, setScope] = useState<"部屋" | "棟">("部屋");
+  const [tone, setTone] = useState<"上品・落ち着き" | "一般的" | "親しみやすい">("一般的");
   const [length, setLength] = useState(500);
-  const [scope, setScope] = useState<Scope>("部屋");
-  const [mustInclude, setMustInclude] = useState<string[]>(["所在地", "最寄駅"]);
-  const [extraKeys, setExtraKeys] = useState("");
+  const [must, setMust] = useState<string[]>(["所在地","築年","構造","最寄駅","徒歩分"]);
+  const [mustFree, setMustFree] = useState("");
+  const [out, setOut] = useState("");
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState("");
-  const [error, setError] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
-  const mergedKeys = Array.from(new Set([
-    ...mustInclude,
-    ...extraKeys.split(",").map((s) => s.trim()).filter(Boolean),
-  ]));
+  function parseSources(input: string) {
+    return input
+      .split(/[\n,]+/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .slice(0, 10); // 念のため最大10件
+  }
 
-  const onToggleKey = (k: string) => {
-    setMustInclude((prev) =>
-      prev.includes(k) ? prev.filter((x) => x !== k) : [...prev, k],
-    );
-  };
-
-  const onGenerate = async () => {
+  async function onGenerate() {
     setLoading(true);
-    setError("");
-    setResult("");
+    setErr(null);
+    setCopied(false);
+    setOut("");
+
+    const sources = parseSources(urlsText);
+    const extra = mustFree
+      .split(/[、,]/)
+      .map(s => s.trim())
+      .filter(Boolean);
+
     try {
       const res = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, tone, length, scope, mustIncludeKeys: mergedKeys }),
+        body: JSON.stringify({
+          sources,
+          propertyName: propertyName.trim() || undefined,
+          scope,
+          tone,
+          length,
+          mustIncludeKeys: Array.from(new Set([...must, ...extra])),
+        }),
       });
-      if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      setResult(data.text);
+      if (!res.ok) throw new Error(typeof data === "string" ? data : (data?.error || "Server Error"));
+      setOut(data.text || "");
     } catch (e: any) {
-      setError(e.message || "不明なエラー");
+      setErr(e?.message || "生成に失敗しました");
     } finally {
       setLoading(false);
     }
-  };
+  }
+
+  async function copyOutput() {
+    if (!out) return;
+    await navigator.clipboard.writeText(out);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
 
   return (
-    <main className="container-narrow py-8 space-y-6">
-      <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">物件紹介文ジェネレーター（外販向け）</h1>
-        <p className="text-sm text-neutral-600">
-          URLから要点抽出。スコープ（部屋/棟）切替・禁止語フィルタ・必須含有キー対応。
-        </p>
-      </header>
+    <main className="max-w-3xl mx-auto px-4 py-10 space-y-8">
+      <h1 className="text-2xl font-semibold">物件紹介文ジェネレーター（外販用）</h1>
 
-      <section className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+      {/* 物件名 */}
+      <div className="space-y-2">
+        <label className="font-medium">物件名（任意）</label>
+        <input
+          className="w-full border rounded-md p-2"
+          placeholder="例）コスモ〇〇マンション"
+          value={propertyName}
+          onChange={(e) => setPropertyName(e.target.value)}
+        />
+        <p className="text-sm text-gray-500">※ 入力した名称は“事実”として扱い、本文に使用します</p>
+      </div>
+
+      {/* 複数URL / テキスト */}
+      <div className="space-y-2">
+        <label className="font-medium">入力（複数URL または テキスト）</label>
+        <textarea
+          className="w-full border rounded-md p-3 h-36"
+          placeholder={`https://example.com/foo\nhttps://example.com/bar\n…（改行またはカンマ区切りで複数OK）`}
+          value={urlsText}
+          onChange={(e) => setUrlsText(e.target.value)}
+        />
+      </div>
+
+      {/* オプション */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="space-y-2">
-          <label className="block text-sm font-medium">スコープ</label>
-          <div className="flex rounded-xl border border-neutral-200 overflow-hidden">
-            {(["部屋","棟"] as Scope[]).map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => setScope(s)}
-                className={"flex-1 px-3 py-2 text-sm " + (scope === s ? "bg-black text-white" : "bg-white text-black")}
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-          <p className="text-xs text-neutral-500">
-            「棟」を選ぶと、間取り・専有面積・方角・リフォーム等の“部屋専用情報”は自動で除外。
-          </p>
+          <label className="font-medium">スコープ</label>
+          <select className="w-full border rounded-md p-2" value={scope} onChange={(e)=>setScope(e.target.value as any)}>
+            <option value="部屋">部屋</option>
+            <option value="棟">棟</option>
+          </select>
         </div>
-
         <div className="space-y-2">
-          <label className="block text-sm font-medium">トーン</label>
-          <select
-            value={tone}
-            onChange={(e) => setTone(e.target.value as Tone)}
-            className="input"
-          >
+          <label className="font-medium">トーン</label>
+          <select className="w-full border rounded-md p-2" value={tone} onChange={(e)=>setTone(e.target.value as any)}>
             <option>上品・落ち着き</option>
             <option>一般的</option>
             <option>親しみやすい</option>
           </select>
         </div>
-
         <div className="space-y-2">
-          <label className="block text-sm font-medium">目安文字数：{length}文字</label>
+          <label className="font-medium">文字数目安</label>
           <input
-            type="range"
-            min={300}
-            max={800}
-            step={50}
+            type="number"
+            className="w-full border rounded-md p-2"
             value={length}
-            onChange={(e) => setLength(parseInt(e.target.value, 10))}
-            className="w-full"
+            min={300}
+            max={1200}
+            onChange={(e)=>setLength(Number(e.target.value))}
           />
         </div>
-      </section>
-
-      <section className="space-y-3">
-        <label className="block text-sm font-medium">入力（物件URL または テキスト）</label>
-        <textarea
-          value={source}
-          onChange={(e) => setSource(e.target.value)}
-          placeholder={`例）https://example.com/property/123
-
-テキスト例（ラベル:値）:
-所在地：東京都板橋区弥生町…
-築年：1991年
-構造：RC
-総戸数：24戸
-最寄駅：東武東上線「中板橋」
-徒歩分：6分
-管理体制：巡回
-設備：オートロック、宅配ボックス
-（部屋）間取り：2LDK／専有面積：55.2m²／方角：南 など`}
-          className="textarea"
-        />
-      </section>
-
-      <section className="space-y-2">
-        <label className="block text-sm font-medium">必ず含めたい項目（該当があれば）</label>
-        <div className="flex flex-wrap gap-2">
-          {CANDIDATE_KEYS.map((k) => (
-            <button
-              key={k}
-              type="button"
-              onClick={() => onToggleKey(k)}
-              className={"badge " + (mustInclude.includes(k) ? "bg-black text-white border-black" : "bg-white text-black border-neutral-300")}
-              title={scope === "棟" && ["間取り","専有面積","バルコニー面積","階","方角","リフォーム","リノベーション","室内設備"].includes(k)
-                ? "棟スコープでは自動的に無視されます" : undefined}
-            >
-              {k}
-            </button>
-          ))}
-        </div>
-        <input
-          value={extraKeys}
-          onChange={(e) => setExtraKeys(e.target.value)}
-          placeholder="自由追加（カンマ区切り）例：学区, 駐輪場"
-          className="input"
-        />
-        <p className="text-xs text-neutral-500">
-          値が抽出できなかった項目は自動スキップ（推測しません）。
-        </p>
-      </section>
-
-      <div className="flex items-center gap-3">
-        <Button onClick={onGenerate} disabled={loading || !source.trim()} color="orange" className="min-w-36">
-          {loading ? "生成中…" : "生成する"}
-        </Button>
-        {error && <span className="text-red-600 text-sm">{error}</span>}
       </div>
 
-      <section className="card p-4">
-        <label className="block text-sm font-medium mb-2">出力</label>
-        <div className="min-h-40 whitespace-pre-wrap">
-          {result || "ここに生成結果が表示されます。"}
+      {/* 必ず含めたい項目 */}
+      <div className="space-y-2">
+        <label className="font-medium">必ず含めたい項目（該当があれば）</label>
+        <div className="flex flex-wrap gap-2">
+          {ALL_KEYS.map(k => {
+            const active = must.includes(k);
+            return (
+              <button
+                key={k}
+                type="button"
+                onClick={() =>
+                  setMust(prev => (prev.includes(k) ? prev.filter(x=>x!==k) : [...prev, k]))
+                }
+                className={`px-3 py-1 rounded-full border ${active ? "bg-black text-white" : "bg-white"}`}
+              >
+                {k}
+              </button>
+            );
+          })}
         </div>
-      </section>
+        <input
+          className="w-full border rounded-md p-2"
+          placeholder="自由追加（カンマ区切り）例：学区, 駐輪場"
+          value={mustFree}
+          onChange={(e)=>setMustFree(e.target.value)}
+        />
+      </div>
+
+      {/* 実行 */}
+      <div className="flex items-center gap-3">
+        <Button onClick={onGenerate} disabled={loading}>
+          {loading ? "生成中…" : "生成する"}
+        </Button>
+        <Button variant="secondary" onClick={copyOutput} disabled={!out}>
+          {copied ? "コピーしました ✓" : "出力をコピー"}
+        </Button>
+      </div>
+
+      {/* 結果 */}
+      {err && <div className="text-red-600 whitespace-pre-wrap">{err}</div>}
+      <div className="border rounded-md p-4 min-h-[160px] whitespace-pre-wrap">
+        {out || "ここに生成結果が表示されます。"}
+      </div>
     </main>
   );
 }
